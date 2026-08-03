@@ -44,17 +44,23 @@
  *   release     Run the interactive release described above, which is the only thing
  *               that writes anything: nothing is created or pushed unless this command
  *               is asked for by name.
+ *   config      Show the config file in use and the folders it lists.
+ *   config edit Open that file in $VISUAL/$EDITOR, creating it if it does not exist
+ *               yet, and report what it lists once the editor is done.
  *
  * Options:
  *   --check     Same as the `check` command.
  *   --dry-run   With `release`, do everything EXCEPT commit and push. The `new-release`
  *               branch is left in place with the changes so you can inspect the diff.
  *   --no-wporg  Skip the wordpress.org lookup and go by version tags alone.
+ *   --config F  Read the default folder list from F instead of the usual places.
+ *   --no-config Ignore any config file and go back to scanning the current directory.
  *   -h, --help  Show usage.
  *
  * Arguments:
- *   [repo ...]  One or more folders to process. If none are given, every folder in
- *               the current directory that is a git repo is processed.
+ *   [repo ...]  One or more folders to process. If none are given, the folders named
+ *               by the config file are processed; with no config either, every folder
+ *               in the current directory that is a git repo is.
  *
  * A failure in one repo is reported and skipped; it does not abort the whole run.
  *
@@ -66,9 +72,10 @@
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const BRANCH = 'new-release';
 
@@ -81,33 +88,73 @@ let CHECK_ONLY = true;
 // actually shipped. QUICK_RELEASER_NO_WPORG exists for the test suite, which must not
 // depend on the network.
 let USE_WPORG = !process.env.QUICK_RELEASER_NO_WPORG;
-const REPOS = []; // explicit repo list from positional args; empty => scan current dir
+// An explicit --config wins over the usual search; --no-config turns the whole
+// mechanism off for this run.
+let CONFIG_PATH = process.env.QUICK_RELEASER_CONFIG || null;
+let NO_CONFIG = false;
+// 'repos' — the usual run over the repositories; 'config' / 'config-edit' — look at
+// the config file itself instead, and touch no repository at all.
+let COMMAND = 'repos';
+const REPOS = []; // explicit repo list from positional args; empty => config, else scan
+
+// The config file that supplies the default folder list. A copy in the folder the
+// repos live in is the common case; the one under the config home is for running
+// from anywhere.
+const CONFIG_BASENAME = '.quick-releaser.json';
+
+function configHome() {
+	return process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+}
 
 function usage() {
 	const me = path.basename(process.argv[1]);
-	console.log(`Usage: ${me} [check|release] [--dry-run] [--no-wporg] [-h|--help] [repo ...]
+	console.log(`Usage: ${me} [check|release|config [edit]] [--dry-run] [--no-wporg]
+       [--config <file>] [--no-config] [-h|--help] [repo ...]
 
-  check       (default) Only report which repos need a release and which pull
-              requests are not in a release yet. Never modifies anything and
-              never asks anything. \`--check\` does the same.
-  release     Make the release commits: create the \`${BRANCH}\` branch, ask for a
-              changelog line per pull request and for the version, then commit
-              and push. Nothing is written unless this command is given.
-  --dry-run   With \`release\`, prepare the branch but do NOT commit or push.
-  --no-wporg  Do not ask wordpress.org which version of a WordPress plugin is
-              published; go by the repo's version tags alone. Useful offline.
-  -h, --help  Show this help.
+  check         (default) Only report which repos need a release and which pull
+                requests are not in a release yet. Never modifies anything and
+                never asks anything. \`--check\` does the same.
+  release       Make the release commits: create the \`${BRANCH}\` branch, ask for a
+                changelog line per pull request and for the version, then commit
+                and push. Nothing is written unless this command is given.
+  config        Show which config file is in use and which folders it lists.
+  config edit   Open that file in \$VISUAL/\$EDITOR, creating it from a template if
+                it does not exist yet, then show what it ended up listing.
+  --dry-run     With \`release\`, prepare the branch but do NOT commit or push.
+  --no-wporg    Do not ask wordpress.org which version of a WordPress plugin is
+                published; go by the repo's version tags alone. Useful offline.
+  --config F    Take the default folder list from F rather than from the usual
+                places (below). It is an error if F does not exist.
+  --no-config   Ignore any config file; scan the current directory instead.
+  -h, --help    Show this help.
 
-  repo ...    Optional list of folders to process. When omitted, every folder
-              in the current directory that is a git repository is processed.
-              (A folder actually named "check" or "release" has to be given as
-              ./check or ./release.)
+  repo ...      Optional list of folders to process. When omitted, the folders
+                named by the config file are processed; with no config either,
+                every folder in the current directory that is a git repository
+                is. (A folder actually named "check", "release" or "config" has
+                to be given as ./check, ./release or ./config.)
+
+Config file, searched for in this order and used only when no folder is given
+on the command line:
+
+  \$QUICK_RELEASER_CONFIG
+  ./${CONFIG_BASENAME}
+  ${path.join(configHome(), 'quick-releaser', 'config.json')}
+
+It is JSON: either a bare array of folders, or an object with a "repos" array.
+Relative paths are taken relative to the config file itself, and a leading ~ is
+expanded, so a config anywhere can name the folders plainly:
+
+  { "repos": ["~/src/my-plugin", "~/src/other-plugin"] }
 
 Examples:
-  ${me}                             # report on every git repo in the current dir
-  ${me} my-plugin ../other          # …on these two only
-  ${me} release my-plugin           # make the release commits for one repo
-  ${me} release --dry-run my-plugin # prepare them without committing or pushing`);
+  ${me}                             # report on the configured repos (or this dir)
+  ${me} my-plugin ../other          # …on these two only, config ignored
+  ${me} --no-config                 # …on every git repo in the current dir
+  ${me} release                     # make the release commits for the configured repos
+  ${me} release --dry-run my-plugin # prepare them without committing or pushing
+  ${me} config                      # show the configured folders
+  ${me} config edit                 # change them in your editor`);
 }
 
 {
@@ -117,6 +164,14 @@ Examples:
 	if (argv[0] === 'check' || argv[0] === 'release') {
 		CHECK_ONLY = argv[0] === 'check';
 		argv.shift();
+	} else if (argv[0] === 'config') {
+		argv.shift();
+		// `config` on its own shows the file; `show` says the same thing out loud.
+		COMMAND = 'config';
+		if (argv[0] === 'edit' || argv[0] === 'show') {
+			COMMAND = argv[0] === 'edit' ? 'config-edit' : 'config';
+			argv.shift();
+		}
 	}
 	while (argv.length) {
 		const arg = argv.shift();
@@ -126,6 +181,14 @@ Examples:
 			CHECK_ONLY = true;
 		} else if (arg === '--no-wporg') {
 			USE_WPORG = false;
+		} else if (arg === '--no-config') {
+			NO_CONFIG = true;
+		} else if (arg === '--config' || arg.startsWith('--config=')) {
+			CONFIG_PATH = arg.startsWith('--config=') ? arg.slice('--config='.length) : argv.shift();
+			if (!CONFIG_PATH) {
+				console.error('--config needs a file');
+				process.exit(64);
+			}
 		} else if (arg === '-h' || arg === '--help') {
 			usage();
 			process.exit(0);
@@ -151,11 +214,247 @@ const warn = (...a) => console.log(`${c('1;33', '  !')} ${a.join(' ')}`);
 const err = (...a) => console.log(`${c('1;31', '  ✗')} ${a.join(' ')}`);
 const note = (...a) => console.log(`    ${a.join(' ')}`);
 
+// --- the configured default folder list --------------------------------------
+/**
+ * The folders to work on when none are named on the command line. Without a config
+ * that is "every git repo in the current directory", which is only useful from the
+ * one directory the repos happen to live in; a config lets the tool be run from
+ * anywhere, and lets a directory holding more repos than you release name just the
+ * ones you do.
+ *
+ * Command line arguments always win: the config supplies a default, never a filter.
+ */
+function defaultConfigPaths() {
+	return [
+		path.resolve(process.cwd(), CONFIG_BASENAME),
+		path.join(configHome(), 'quick-releaser', 'config.json'),
+	];
+}
+
+function configCandidatePaths() {
+	return CONFIG_PATH ? [path.resolve(expandHome(CONFIG_PATH))] : defaultConfigPaths();
+}
+
+function expandHome(p) {
+	if (p === '~') return os.homedir();
+	if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+	return p;
+}
+
+/** The first config file that exists, or null. */
+function findConfigFile() {
+	return configCandidatePaths().find((f) => fs.existsSync(f)) || null;
+}
+
+/**
+ * Read one config file. Returns { entries, repos } — the folders as they are written
+ * in the file, and the same folders resolved to absolute paths — or { error } when
+ * the file is not something we can act on.
+ */
+function parseConfigFile(file) {
+	let parsed;
+	try {
+		parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+	} catch (e) {
+		return { error: `not valid JSON (${e.message})` };
+	}
+	const listed = Array.isArray(parsed)
+		? parsed
+		: (parsed && typeof parsed === 'object' && Array.isArray(parsed.repos) ? parsed.repos : null);
+	if (!listed) {
+		return { error: 'expected an array of folders, or an object with a "repos" array' };
+	}
+	if (listed.some((r) => typeof r !== 'string' || !r.trim())) {
+		return { error: 'every entry must be a non-empty folder name' };
+	}
+
+	// Relative entries are relative to the config file, not to wherever the tool
+	// happens to be run from — that is the whole point of having one.
+	const base = path.dirname(file);
+	const entries = [];
+	const repos = [];
+	for (const raw of listed) {
+		const entry = raw.trim().replace(/\/+$/, '');
+		const resolved = path.resolve(base, expandHome(entry));
+		if (repos.includes(resolved)) continue;
+		entries.push(entry);
+		repos.push(resolved);
+	}
+	return { entries, repos };
+}
+
+/**
+ * Read the first config file that exists. Returns { file, repos } with the folders
+ * resolved to absolute paths, or null when there is no config to use.
+ *
+ * A config that exists but cannot be understood is fatal rather than ignored:
+ * silently falling back to "every folder in the current directory" would run the
+ * tool over a much larger set of repos than the one that was asked for.
+ */
+function loadConfig() {
+	if (NO_CONFIG) return null;
+
+	const file = findConfigFile();
+	if (!file) {
+		if (CONFIG_PATH) {
+			console.error(`no such config file: ${CONFIG_PATH}`);
+			process.exit(66);
+		}
+		return null;
+	}
+
+	const parsed = parseConfigFile(file);
+	if (parsed.error) {
+		console.error(`${file}: ${parsed.error}`);
+		process.exit(65);
+	}
+	if (!parsed.repos.length) {
+		warn(`${file} lists no folders — ignoring it`);
+		return null;
+	}
+	return { file, repos: parsed.repos };
+}
+
+/** A folder as it is worth printing back at the user: relative when it is nearby. */
+function shortPath(dir) {
+	const rel = path.relative(process.cwd(), dir);
+	return rel && !rel.startsWith('..') ? rel : dir;
+}
+
+// --- the `config` command ----------------------------------------------------
+// What a brand new config file is seeded with. JSON has no comments, so the note
+// about how the file is read has to live in a field of its own — anything that is
+// not "repos" is ignored, so it costs nothing to keep it there.
+const CONFIG_TEMPLATE = {
+	_comment: 'Folders quick-releaser works on when none are given on the command line. '
+		+ 'Relative paths are relative to this file, and a leading ~ is expanded.',
+	repos: [],
+};
+
+/** Print a config file and the state of every folder it names. */
+function printConfig(file, parsed) {
+	info(`config: ${file}`);
+	if (!parsed.repos.length) {
+		warn('it lists no folders, so it is ignored — every git repo in the current directory is processed');
+		return;
+	}
+	info(`${parsed.repos.length} folder(s):`);
+	for (let i = 0; i < parsed.repos.length; i++) {
+		const dir = parsed.repos[i];
+		const entry = parsed.entries[i];
+		// A relative or ~-prefixed entry is worth showing both ways: as it is written
+		// in the file, and as the folder it actually resolves to.
+		const shown = entry === dir ? entry : `${entry}  ${c('0;90', `(${dir})`)}`;
+		if (!fs.existsSync(dir)) {
+			err(`${shown} — missing`);
+		} else if (!fs.existsSync(path.join(dir, '.git'))) {
+			warn(`${shown} — not a git repository`);
+		} else {
+			ok(shown);
+		}
+	}
+}
+
+/** `config` — say which file supplies the default folder list, and what is in it. */
+function showConfig() {
+	const me = path.basename(process.argv[1]);
+	const file = findConfigFile();
+
+	if (!file) {
+		if (CONFIG_PATH) {
+			err(`no such config file: ${CONFIG_PATH}`);
+			return 66;
+		}
+		warn('no config file — every git repository in the current directory is processed');
+		note('looked for:');
+		for (const f of configCandidatePaths()) note(`  ${f}`);
+		note(`run '${me} config edit' to make one.`);
+		return 0;
+	}
+
+	const parsed = parseConfigFile(file);
+	if (parsed.error) {
+		err(`${file}: ${parsed.error}`);
+		note(`fix it with '${me} config edit'.`);
+		return 65;
+	}
+
+	printConfig(file, parsed);
+	note('folders named on the command line are used instead of these; --no-config ignores them.');
+	if (NO_CONFIG) warn('--no-config was given, so a run right now would ignore this file');
+	return 0;
+}
+
+/** The editor to open the config in, and whether we had to guess it. */
+function editorCommand() {
+	const configured = process.env.VISUAL || process.env.EDITOR;
+	return configured ? { command: configured, guessed: false } : { command: 'vi', guessed: true };
+}
+
+/**
+ * `config edit` — open the config file in the user's editor, creating it from the
+ * template first if there is none yet, and report what it lists afterwards.
+ */
+function editConfig() {
+	const me = path.basename(process.argv[1]);
+	// Where a config would be read from, or — when there is none anywhere — the one
+	// under the config home, since that is the copy that works from any directory.
+	const file = CONFIG_PATH
+		? path.resolve(expandHome(CONFIG_PATH))
+		: (findConfigFile() || path.join(configHome(), 'quick-releaser', 'config.json'));
+
+	if (!fs.existsSync(file)) {
+		try {
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, `${JSON.stringify(CONFIG_TEMPLATE, null, 2)}\n`);
+		} catch (e) {
+			err(`could not create ${file}: ${e.message}`);
+			return 73;
+		}
+		ok(`created ${file}`);
+	}
+
+	const editor = editorCommand();
+	if (editor.guessed) warn(`neither $VISUAL nor $EDITOR is set — using ${editor.command}`);
+	info(`opening ${file} in ${editor.command}`);
+
+	// The file goes in as an argument rather than inside the command string, so a
+	// path with spaces in it survives, and $EDITOR can carry its own options.
+	const res = spawnSync('sh', ['-c', `${editor.command} "$@"`, 'sh', file], { stdio: 'inherit' });
+	if (res.error) {
+		err(`could not run ${editor.command}: ${res.error.message}`);
+		return 73;
+	}
+	if (res.status !== 0) {
+		err(`${editor.command} exited with status ${res.status} — leaving ${file} alone`);
+		return 73;
+	}
+
+	const parsed = parseConfigFile(file);
+	if (parsed.error) {
+		err(`${file}: ${parsed.error}`);
+		note(`the file was saved as it is; run '${me} config edit' again to fix it.`);
+		return 65;
+	}
+	printConfig(file, parsed);
+
+	// Editing a file that something else shadows would otherwise look like it took
+	// effect when it did not. Only `--config` can get us here: without it we always
+	// edit the file the search finds.
+	const inUse = defaultConfigPaths().find((f) => fs.existsSync(f));
+	if (inUse && path.resolve(inUse) !== path.resolve(file)) {
+		warn(`${inUse} is found first, so runs without --config will use that one instead`);
+	}
+	return 0;
+}
+
 // --- summary state -----------------------------------------------------------
 let processed = 0;
 let released = 0;
 let skipped = 0;
 let failed = 0;
+// Set by the commands that have something more specific to say than "a repo failed".
+let exitCode = null;
 const releaseReport = []; // { repo, version, entries, pushed }
 const checkReport = []; // { repo, version, suggested, prs, others } — check mode only
 const followUps = []; // { repo, detail } — version strings we deliberately did not touch
@@ -1119,7 +1418,7 @@ async function checkRepo(dir) {
 		if (baseline.pending) {
 			// Nothing to write, but the version still has not gone out.
 			warn(`${project.version} is unreleased and there is nothing to add to its changelog — it needs tagging/releasing, not a release commit`);
-			checkReport.push({ repo: name, version: project.version, suggested: project.version, pending: true, released: baseline.released, prs, documented, chores, others });
+			checkReport.push({ repo: name, dir: cwd, version: project.version, suggested: project.version, pending: true, released: baseline.released, prs, documented, chores, others });
 			return NEEDED;
 		}
 		ok(`no pull requests merged since ${project.version} — no release needed`);
@@ -1157,7 +1456,7 @@ async function checkRepo(dir) {
 		if (others.length > 10) note(c('0;90', `  … and ${others.length - 10} more`));
 	}
 
-	checkReport.push({ repo: name, version: project.version, suggested, pending: baseline.pending, released: baseline.released, prs, documented, tagOnly, chores, others });
+	checkReport.push({ repo: name, dir: cwd, version: project.version, suggested, pending: baseline.pending, released: baseline.released, prs, documented, tagOnly, chores, others });
 	return NEEDED;
 }
 
@@ -1480,6 +1779,17 @@ async function processRepo(dir) {
 
 // --- main --------------------------------------------------------------------
 async function main() {
+	// The config commands look at the config file itself and never touch a repo.
+	if (COMMAND === 'config' || COMMAND === 'config-edit') {
+		if (REPOS.length) {
+			console.error(`the config command takes no folders (got: ${REPOS.join(' ')})`);
+			exitCode = 64;
+			return;
+		}
+		exitCode = COMMAND === 'config-edit' ? editConfig() : showConfig();
+		return;
+	}
+
 	// Only the release run is interactive; `check` is fine in a pipe or a cron job.
 	if (!CHECK_ONLY && !SCRIPTED_ANSWERS && !process.stdin.isTTY) {
 		console.error("the 'release' command needs an interactive terminal (it asks for changelog text and the version to bump to).");
@@ -1494,17 +1804,29 @@ async function main() {
 		info('DRY RUN — no commits or pushes will be made.');
 	}
 
-	// Build the list of candidate directories: explicit args, or a scan of $PWD.
+	// Build the list of candidate directories: explicit args, the configured default
+	// list, or a scan of $PWD.
 	let candidates;
+	// Whether the list was asked for by name (arguments or config) rather than found
+	// by scanning: a folder that was named and turns out not to be a repo is worth
+	// complaining about, a folder that merely sits in the current directory is not.
+	let named = true;
 	if (REPOS.length) {
 		info(`Processing ${REPOS.length} folder(s) given on the command line…`);
 		candidates = REPOS.map((r) => r.replace(/\/+$/, ''));
 	} else {
-		info(`Scanning ${process.cwd()} for git repositories…`);
-		candidates = fs.readdirSync(process.cwd(), { withFileTypes: true })
-			.filter((e) => e.isDirectory())
-			.map((e) => e.name)
-			.sort();
+		const config = loadConfig();
+		if (config) {
+			info(`Processing ${config.repos.length} folder(s) from ${config.file}…`);
+			candidates = config.repos;
+		} else {
+			info(`Scanning ${process.cwd()} for git repositories…`);
+			candidates = fs.readdirSync(process.cwd(), { withFileTypes: true })
+				.filter((e) => e.isDirectory())
+				.map((e) => e.name)
+				.sort();
+			named = false;
+		}
 	}
 	console.log();
 
@@ -1517,7 +1839,7 @@ async function main() {
 		}
 		if (!fs.existsSync(path.join(dir, '.git'))) {
 			// An explicitly-named non-repo is worth flagging; a scanned one is just noise.
-			if (REPOS.length) {
+			if (named) {
 				warn(`not a git repository: ${dir} — skipping`);
 				skipped++;
 			}
@@ -1550,7 +1872,7 @@ async function main() {
 	}
 
 	if (!foundAny) {
-		warn(REPOS.length ? 'None of the supplied folders were git repositories.' : 'No git repositories found in the current directory.');
+		warn(named ? 'None of the supplied folders were git repositories.' : 'No git repositories found in the current directory.');
 	}
 
 	if (CHECK_ONLY) {
@@ -1578,7 +1900,7 @@ async function main() {
 			const tagOnlyRepos = checkReport.filter((r) => r.tagOnly || !r.prs.length);
 			const needCommits = checkReport.filter((r) => !tagOnlyRepos.includes(r));
 			if (needCommits.length) {
-				note(`run '${path.basename(process.argv[1])} release ${needCommits.map((r) => r.repo).join(' ')}' to make the release commits.`);
+				note(`run '${path.basename(process.argv[1])} release ${needCommits.map((r) => shortPath(r.dir)).join(' ')}' to make the release commits.`);
 			}
 			if (tagOnlyRepos.length) {
 				note(`${tagOnlyRepos.map((r) => `${r.repo} (${r.version})`).join(', ')} only need a tag and a github release.`);
@@ -1618,7 +1940,7 @@ async function main() {
 main()
 	.then(() => {
 		closeRl();
-		process.exit(failed > 0 ? 1 : 0);
+		process.exit(exitCode !== null ? exitCode : (failed > 0 ? 1 : 0));
 	})
 	.catch((e) => {
 		closeRl();

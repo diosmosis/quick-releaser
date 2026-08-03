@@ -18,6 +18,11 @@ setup_sandbox() {
     export HOME="$TEST_TMP/home"
     mkdir -p "$HOME"
 
+    # The default folder list must come from the test, never from the config the
+    # machine running the suite happens to have — and `config edit` must never
+    # open the real editor of whoever is running it.
+    unset XDG_CONFIG_HOME QUICK_RELEASER_CONFIG VISUAL EDITOR
+
     export GIT_CONFIG_NOSYSTEM=1
     export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
     : > "$GIT_CONFIG_GLOBAL"

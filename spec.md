@@ -6,13 +6,65 @@ A script that helps quickly create release commits/branches for multiple repos f
 
 ## Commands
 
-The script has two commands:
+The script has these commands:
 
 - `check`, the default, which only reports what would be released, as described in [Check Execution](#check-execution).
 - `release`, which makes the release commits/branches as described in [Release Execution](#release-execution).
+- `config` and `config edit`, which show and change the default set of projects, as described in
+  [The Projects To Run On](#the-projects-to-run-on).
 
 Reporting is the default and `release` has to be asked for by name, so running the script with no command — the
 easiest thing to do by accident — can never write, commit or push anything.
+
+## The Projects To Run On
+
+Which folders a run works on is decided in this order, first one that applies:
+
+1. the folders given as command line arguments.
+2. the folders listed in a config file — see below.
+3. every folder in the current directory that is a git repository.
+
+So the config only ever supplies a *default*: naming folders on the command line ignores it entirely, and
+`--no-config` ignores it too, going straight back to scanning the current directory.
+
+The config file is looked for in this order, and the first one that exists is used:
+
+1. `$QUICK_RELEASER_CONFIG`, or the file given with `--config <file>`. Naming a file that does not exist is an error.
+2. `.quick-releaser.json` in the current directory — the natural place for a config that describes one folder of
+   repos.
+3. `$XDG_CONFIG_HOME/quick-releaser/config.json` (`~/.config/quick-releaser/config.json` by default) — the one that
+   lets the tool be run from anywhere.
+
+It is JSON, either a bare array of folders or an object with a `repos` array, so it has room to grow:
+
+```json
+{ "repos": ["~/src/my-plugin", "~/src/other-plugin"] }
+```
+
+1. a leading `~` is expanded, and relative paths are resolved against the directory the config file is in — not
+   against wherever the tool was run from, which is the whole point of having one.
+2. a config that exists but cannot be understood (bad JSON, not a list of folders) is a fatal error rather than
+   something to ignore: quietly falling back to "every folder in the current directory" would run over a much larger
+   set of repos than was asked for.
+3. a configured folder that has gone missing or is not a git repository is reported, exactly as a folder named on the
+   command line would be. Only scanned folders are skipped silently.
+4. the `check` summary suggests a `release` command line with folder paths that work from the current directory, so it
+   is still copy-pasteable when the configured repos live somewhere else.
+
+### Inspecting And Editing It
+
+Two commands work on the config file itself and never touch a repository:
+
+1. `config` prints which file supplies the default list (or, when there is none, where it looked) and every folder the
+   file names — as written and as resolved — saying for each whether it exists and is a git repository. A file that
+   cannot be understood is reported the same way it is during a run, and exits non-zero.
+2. `config edit` opens that file in `$VISUAL`, then `$EDITOR`, falling back to `vi` with a note. When there is no
+   config anywhere it creates one first, from a template, at the config home path — the copy that works from any
+   directory. Afterwards it re-reads the file and prints it exactly as `config` does, so a mistake is caught straight
+   away rather than on the next run. If the file it edited is shadowed by one found earlier in the search order, it
+   says so.
+
+Both take no folder arguments, and `--config <file>` picks which file they work on.
 
 ## Release Execution
 
@@ -124,14 +176,14 @@ Requirements specific to this command:
 ## Notes
 
 1. The script is meant to run on WordPress plugins and Matomo plugins. So when looking for the current release or updating the release and changelog, it should follow the conventions of those types of projects. Other types of projects are not supported at present.
-2. By default it should look at all folders in the current repo, but specific folders can be specified via command line arguments.
+2. By default it should look at all folders in the current repo, but specific folders can be specified via command line arguments, or configured as a default set — see [The Projects To Run On](#the-projects-to-run-on).
 3. mimic relevant parts of the implementation of another script located in ../dependency-update/update-dependencies.sh.
 4. pull requests will normally be squashed then merged, but sometimes there will be a merge commit.
 5. `--dry-run` prepares the release branch but does not commit or push. it applies to `release` only; `check` ignores it with a note.
 6. the script can use bash, node.js or php, whichever claude thinks is most suited for this script.
 7. the folder arguments apply to every command, e.g. `quick-releaser.js my-plugin` checks one repo only. a command
    word is only recognised as the first argument, so a folder actually named `check` or `release` can still be passed
-   as `./check` or `./release`.
+   as `./check` or `./release`. the configured default list likewise applies to every command.
 
 ## Tests
 
