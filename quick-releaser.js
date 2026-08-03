@@ -37,16 +37,18 @@
  * inspected and the new entry mimics their heading and bullet style.
  *
  * Commands:
- *   (default)   Run the interactive release described above.
- *   check       Only report which repos need a release, listing the pull requests
- *               merged since the current version. Read-only: it fetches, but never
- *               checks out, pulls, writes, commits or pushes, and never prompts,
+ *   check       (default) Only report which repos need a release, listing the pull
+ *               requests merged since the last release. Read-only: it fetches, but
+ *               never checks out, pulls, writes, commits or pushes, and never prompts,
  *               so it is safe to run over dirty working trees and from scripts.
+ *   release     Run the interactive release described above, which is the only thing
+ *               that writes anything: nothing is created or pushed unless this command
+ *               is asked for by name.
  *
  * Options:
  *   --check     Same as the `check` command.
- *   --dry-run   Do everything EXCEPT commit and push. The `new-release` branch is
- *               left in place with the changes so you can inspect `git diff` yourself.
+ *   --dry-run   With `release`, do everything EXCEPT commit and push. The `new-release`
+ *               branch is left in place with the changes so you can inspect the diff.
  *   --no-wporg  Skip the wordpress.org lookup and go by version tags alone.
  *   -h, --help  Show usage.
  *
@@ -72,7 +74,9 @@ const BRANCH = 'new-release';
 
 // --- argument parsing --------------------------------------------------------
 let DRY_RUN = false;
-let CHECK_ONLY = false;
+// Reporting is the default; making and pushing release commits has to be asked for by
+// name. Running the tool with no command can then never change anything.
+let CHECK_ONLY = true;
 // WordPress plugins are released to wordpress.org, which is authoritative about what
 // actually shipped. QUICK_RELEASER_NO_WPORG exists for the test suite, which must not
 // depend on the network.
@@ -81,34 +85,37 @@ const REPOS = []; // explicit repo list from positional args; empty => scan curr
 
 function usage() {
 	const me = path.basename(process.argv[1]);
-	console.log(`Usage: ${me} [check] [--dry-run] [-h|--help] [repo ...]
+	console.log(`Usage: ${me} [check|release] [--dry-run] [--no-wporg] [-h|--help] [repo ...]
 
-  check       Only report which repos need a release and which pull requests
-              are not in a release yet. Never modifies anything and never asks
-              anything. \`--check\` does the same.
-  --dry-run   Prepare the release branch, but do NOT commit or push.
+  check       (default) Only report which repos need a release and which pull
+              requests are not in a release yet. Never modifies anything and
+              never asks anything. \`--check\` does the same.
+  release     Make the release commits: create the \`${BRANCH}\` branch, ask for a
+              changelog line per pull request and for the version, then commit
+              and push. Nothing is written unless this command is given.
+  --dry-run   With \`release\`, prepare the branch but do NOT commit or push.
   --no-wporg  Do not ask wordpress.org which version of a WordPress plugin is
               published; go by the repo's version tags alone. Useful offline.
   -h, --help  Show this help.
 
   repo ...    Optional list of folders to process. When omitted, every folder
               in the current directory that is a git repository is processed.
-              (A folder actually named "check" has to be given as ./check.)
+              (A folder actually named "check" or "release" has to be given as
+              ./check or ./release.)
 
 Examples:
-  ${me}                          # every git repo in the current dir
-  ${me} my-plugin ../other       # only these two repos
-  ${me} --dry-run my-plugin      # dry run against one repo
-  ${me} check                    # report what needs releasing, change nothing
-  ${me} check my-plugin          # …for one repo only`);
+  ${me}                             # report on every git repo in the current dir
+  ${me} my-plugin ../other          # …on these two only
+  ${me} release my-plugin           # make the release commits for one repo
+  ${me} release --dry-run my-plugin # prepare them without committing or pushing`);
 }
 
 {
 	const argv = process.argv.slice(2);
-	// `check` is a command, so it is only recognised in the first position; that
-	// keeps a folder that happens to be named "check" reachable as ./check.
-	if (argv[0] === 'check') {
-		CHECK_ONLY = true;
+	// Commands are only recognised in the first position; that keeps a folder that
+	// happens to be named "check" or "release" reachable as ./check or ./release.
+	if (argv[0] === 'check' || argv[0] === 'release') {
+		CHECK_ONLY = argv[0] === 'check';
 		argv.shift();
 	}
 	while (argv.length) {
@@ -1475,13 +1482,13 @@ async function processRepo(dir) {
 async function main() {
 	// Only the release run is interactive; `check` is fine in a pipe or a cron job.
 	if (!CHECK_ONLY && !SCRIPTED_ANSWERS && !process.stdin.isTTY) {
-		console.error('quick-releaser needs an interactive terminal (it asks for changelog text and the version to bump to).');
-		console.error("use the 'check' command if you only want to know which repos need a release.");
+		console.error("the 'release' command needs an interactive terminal (it asks for changelog text and the version to bump to).");
+		console.error('drop it to just report which repos need a release; that never prompts.');
 		process.exit(1);
 	}
 
 	if (CHECK_ONLY) {
-		info('CHECK ONLY — reporting what needs a release; nothing will be modified.');
+		info("CHECK — reporting what needs a release; nothing will be modified. Use the 'release' command to make the commits.");
 		if (DRY_RUN) warn('--dry-run has no effect in check mode (nothing is written either way).');
 	} else if (DRY_RUN) {
 		info('DRY RUN — no commits or pushes will be made.');
@@ -1571,7 +1578,7 @@ async function main() {
 			const tagOnlyRepos = checkReport.filter((r) => r.tagOnly || !r.prs.length);
 			const needCommits = checkReport.filter((r) => !tagOnlyRepos.includes(r));
 			if (needCommits.length) {
-				note(`run '${path.basename(process.argv[1])} ${needCommits.map((r) => r.repo).join(' ')}' to make the release commits.`);
+				note(`run '${path.basename(process.argv[1])} release ${needCommits.map((r) => r.repo).join(' ')}' to make the release commits.`);
 			}
 			if (tagOnlyRepos.length) {
 				note(`${tagOnlyRepos.map((r) => `${r.repo} (${r.version})`).join(', ')} only need a tag and a github release.`);

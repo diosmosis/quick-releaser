@@ -8,12 +8,15 @@ A script that helps quickly create release commits/branches for multiple repos f
 
 The script has two commands:
 
-- the default (no command) command, which makes the release commits/branches as described in [Release Execution](#release-execution).
-- `check`, which only reports what would be released, as described in [Check Execution](#check-execution).
+- `check`, the default, which only reports what would be released, as described in [Check Execution](#check-execution).
+- `release`, which makes the release commits/branches as described in [Release Execution](#release-execution).
+
+Reporting is the default and `release` has to be asked for by name, so running the script with no command — the
+easiest thing to do by accident — can never write, commit or push anything.
 
 ## Release Execution
 
-The script should do the following for every repo it finds:
+The `release` command should do the following for every repo it finds:
 
 1. switch to the default branch for the repo, pull from origin and fast forward.
 2. work out the last version that was actually released — see [Unreleased Version Bumps](#unreleased-version-bumps).
@@ -56,8 +59,8 @@ version file. Two things count, and the newest of them wins:
 
 When the declared version is ahead of the last released version:
 
-1. the unreleased work is everything merged since the tag, not since the commit that set the declared version (which
-   would hide every pull request that shipped with, or before, the bump).
+1. the unreleased work is everything merged since the last release, not since the commit that set the declared version
+   (which would hide every pull request that shipped with, or before, the bump).
 2. the release to make is the declared version itself — nothing is bumped. it is offered as the default answer to the
    version question, and a higher version can still be entered to bump on top of it.
 3. pull requests in that range that already edited the project's own (root level) changelog are assumed to have written
@@ -93,8 +96,8 @@ and whichever is newer decides what counts as released.
 
 ## Check Execution
 
-The `check` command (also available as `--check`) only detects whether a new release is needed; it never creates a
-release. For every repo it finds it should:
+The `check` command (the default, also available as `--check`) only detects whether a new release is needed; it never
+creates a release. For every repo it finds it should:
 
 1. fetch from origin (tags included), then work out the last released version and the pull requests merged since it,
    using the same logic as the release command (steps 2, 3 and 5 above).
@@ -124,11 +127,11 @@ Requirements specific to this command:
 2. By default it should look at all folders in the current repo, but specific folders can be specified via command line arguments.
 3. mimic relevant parts of the implementation of another script located in ../dependency-update/update-dependencies.sh.
 4. pull requests will normally be squashed then merged, but sometimes there will be a merge commit.
-5. there should be a dry run version that does not commit or push.
+5. `--dry-run` prepares the release branch but does not commit or push. it applies to `release` only; `check` ignores it with a note.
 6. the script can use bash, node.js or php, whichever claude thinks is most suited for this script.
-7. the folder arguments apply to every command, e.g. `quick-releaser.js check my-plugin` checks one repo only. the
-   `check` command word is only recognised as the first argument, so a folder that is actually named `check` can still
-   be passed as `./check`.
+7. the folder arguments apply to every command, e.g. `quick-releaser.js my-plugin` checks one repo only. a command
+   word is only recognised as the first argument, so a folder actually named `check` or `release` can still be passed
+   as `./check` or `./release`.
 
 ## Tests
 

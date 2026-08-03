@@ -135,9 +135,9 @@ wporg_requests() {
     tr '\n' ' ' < "$TEST_TMP/.wporg-port.requests" | sed 's/ $//'
 }
 
-# The release run is interactive. QUICK_RELEASER_INPUT feeds it one answer per
-# line in the order the questions are asked, so the tests drive the real code
-# path rather than a testing-only variant of it:
+# The `release` command, which is interactive. QUICK_RELEASER_INPUT feeds it one
+# answer per line in the order the questions are asked, so the tests drive the
+# real code path rather than a testing-only variant of it:
 #
 #   ''         accept the pre-filled default (what pressing Enter does)
 #   '<empty>'  submit an empty answer        (what clearing the line does)
@@ -160,7 +160,7 @@ qr_release() {  # qr_release <repo> <answer>... -- <args>...
     fi
 
     set +e
-    QR_OUT="$(cd "$TEST_TMP" && QUICK_RELEASER_INPUT="$input" node "$QR" "${args[@]}" "$repo" 2>&1)"
+    QR_OUT="$(cd "$TEST_TMP" && QUICK_RELEASER_INPUT="$input" node "$QR" release "${args[@]}" "$repo" 2>&1)"
     QR_RC=$?
     set -e
     return 0
