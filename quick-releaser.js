@@ -6,9 +6,11 @@
  * given on the command line) and, for each one that needs a release:
  *
  *   1. Switches to the repo's default branch and pulls with fast-forward only
- *   2. Works out the last version that was actually RELEASED (the newest version tag
- *      reachable from the default branch) and compares it with the version the source
- *      declares. Those differ when a version bump has been merged but never released.
+ *   2. Works out the last version that was actually RELEASED — the newest version tag
+ *      reachable from the default branch, or, for a plugin in the WordPress plugin
+ *      directory, the version wordpress.org is serving, whichever is newer — and
+ *      compares it with the version the source declares. Those differ when a version
+ *      bump has been merged but never released.
  *   3. Collects every pull request merged into the default branch since that release.
  *      Pull requests marked `[no_release]` are reported but do not count: they get no
  *      changelog line and never make a release necessary on their own.
@@ -45,6 +47,7 @@
  *   --check     Same as the `check` command.
  *   --dry-run   Do everything EXCEPT commit and push. The `new-release` branch is
  *               left in place with the changes so you can inspect `git diff` yourself.
+ *   --no-wporg  Skip the wordpress.org lookup and go by version tags alone.
  *   -h, --help  Show usage.
  *
  * Arguments:
@@ -59,6 +62,8 @@
 'use strict';
 
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const path = require('path');
 const readline = require('readline');
 const { execFileSync } = require('child_process');
@@ -68,6 +73,10 @@ const BRANCH = 'new-release';
 // --- argument parsing --------------------------------------------------------
 let DRY_RUN = false;
 let CHECK_ONLY = false;
+// WordPress plugins are released to wordpress.org, which is authoritative about what
+// actually shipped. QUICK_RELEASER_NO_WPORG exists for the test suite, which must not
+// depend on the network.
+let USE_WPORG = !process.env.QUICK_RELEASER_NO_WPORG;
 const REPOS = []; // explicit repo list from positional args; empty => scan current dir
 
 function usage() {
@@ -78,6 +87,8 @@ function usage() {
               are not in a release yet. Never modifies anything and never asks
               anything. \`--check\` does the same.
   --dry-run   Prepare the release branch, but do NOT commit or push.
+  --no-wporg  Do not ask wordpress.org which version of a WordPress plugin is
+              published; go by the repo's version tags alone. Useful offline.
   -h, --help  Show this help.
 
   repo ...    Optional list of folders to process. When omitted, every folder
@@ -106,6 +117,8 @@ Examples:
 			DRY_RUN = true;
 		} else if (arg === '--check') {
 			CHECK_ONLY = true;
+		} else if (arg === '--no-wporg') {
+			USE_WPORG = false;
 		} else if (arg === '-h' || arg === '--help') {
 			usage();
 			process.exit(0);
@@ -265,6 +278,9 @@ async function askYesNo(question, defaultYes = true) {
 const JSON_VERSION_RE = /("version"\s*:\s*")([^"]+)(")/;
 const PHP_HEADER_VERSION_RE = /^(\s*(?:\*\s*)?Version\s*:\s*)([0-9][^\s*]*)\s*$/im;
 const STABLE_TAG_RE = /^(\s*Stable tag\s*:\s*)([0-9][^\s]*)\s*$/im;
+// `Plugin URI: https://wordpress.org/plugins/wp-piwik/` names the directory slug
+// outright. The old /extend/ form is still in plenty of headers.
+const PLUGIN_URI_SLUG_RE = /Plugin URI\s*:\s*\S*wordpress\.org\/(?:extend\/)?plugins\/([A-Za-z0-9][A-Za-z0-9._-]*)/i;
 
 /**
  * Detection reads a handful of files at the top of the repo. It is fed through a
@@ -311,16 +327,18 @@ function detectProject(reader) {
 		if (content === null) continue;
 		const head = content.slice(0, 8192);
 		if (!/^\s*(?:\*\s*)?Plugin Name\s*:/im.test(head)) continue;
+		const slugMatch = head.match(PLUGIN_URI_SLUG_RE);
+		const wporgSlug = slugMatch ? slugMatch[1].toLowerCase() : null;
 		const m = head.match(PHP_HEADER_VERSION_RE);
 		if (m) {
-			return { type: 'wordpress', versionFile: file, version: m[2].trim(), mainFile: file };
+			return { type: 'wordpress', versionFile: file, version: m[2].trim(), mainFile: file, wporgSlug };
 		}
 		// Header present but no Version: line — fall back to readme.txt's stable tag.
 		const readme = reader.read('readme.txt');
 		if (readme !== null) {
 			const tag = readme.match(STABLE_TAG_RE);
 			if (tag) {
-				return { type: 'wordpress', versionFile: 'readme.txt', version: tag[2].trim(), mainFile: file };
+				return { type: 'wordpress', versionFile: 'readme.txt', version: tag[2].trim(), mainFile: file, wporgSlug };
 			}
 		}
 	}
@@ -359,22 +377,27 @@ function versionAtCommit(cwd, project, sha) {
 }
 
 /**
- * Find the commit that bumped the version to its current value: walk the commits
- * touching the version file newest-first and keep going while they still carry the
- * current version. The oldest one that does is the bump commit.
+ * Find the commit that set the version to `version`: walk the commits touching the
+ * version file newest-first, skip past the newer versions, then keep going while they
+ * still carry the one we want. The oldest of those is the commit that set it.
  */
-function findVersionBumpCommit(cwd, project, branchRef) {
+function findVersionSetCommit(cwd, project, branchRef, version) {
 	const log = gitOut(cwd, ['log', '--first-parent', '--format=%H', branchRef, '--', project.versionFile]);
 	if (!log) return null;
 	let bump = null;
 	for (const sha of log.split('\n').filter(Boolean)) {
-		if (versionAtCommit(cwd, project, sha) === project.version) {
+		if (versionAtCommit(cwd, project, sha) === version) {
 			bump = sha;
-		} else {
+		} else if (bump) {
 			break;
 		}
 	}
 	return bump;
+}
+
+/** The commit that bumped the version to the value the source declares today. */
+function findVersionBumpCommit(cwd, project, branchRef) {
+	return findVersionSetCommit(cwd, project, branchRef, project.version);
 }
 
 // --- pull request collection -------------------------------------------------
@@ -466,6 +489,85 @@ function compareVersions(a, b) {
 	return (pa.major - pb.major) || (pa.minor - pb.minor) || (pa.patch - pb.patch);
 }
 
+// --- wordpress.org -----------------------------------------------------------
+// A plugin published in the WordPress plugin directory is released by pushing to its
+// SVN repo, which git knows nothing about: wp-matomo, for instance, has shipped three
+// versions past its newest git tag. For those plugins the directory is the authority on
+// what is actually out there.
+const WPORG_API = process.env.QUICK_RELEASER_WPORG_API || 'https://api.wordpress.org/plugins/info/1.0';
+const WPORG_TIMEOUT_MS = 6000;
+// One connection failure is enough to conclude we are offline; the rest of the run then
+// goes by tags alone rather than stalling on every WordPress plugin it meets.
+let wporgReachable = true;
+
+/** GET a JSON document. Resolves to { status, body }; never rejects. */
+function fetchJson(url) {
+	return new Promise((resolve) => {
+		let settled = false;
+		const done = (value) => {
+			if (!settled) {
+				settled = true;
+				resolve(value);
+			}
+		};
+		const client = url.startsWith('http://') ? http : https;
+		const req = client.get(url, { timeout: WPORG_TIMEOUT_MS, headers: { 'user-agent': 'quick-releaser' } }, (res) => {
+			if (res.statusCode !== 200) {
+				res.resume();
+				done({ status: res.statusCode, body: null });
+				return;
+			}
+			let raw = '';
+			res.setEncoding('utf8');
+			res.on('data', (chunk) => { raw += chunk; });
+			res.on('end', () => {
+				try {
+					done({ status: 200, body: JSON.parse(raw) });
+				} catch (e) {
+					done({ status: 200, body: null });
+				}
+			});
+		});
+		req.on('timeout', () => req.destroy(new Error('timed out')));
+		req.on('error', () => done({ status: 0, body: null }));
+	});
+}
+
+/**
+ * The slugs this plugin might be published under, best guess first: the one its
+ * `Plugin URI` header names, then the main file's name, then the folder's. WordPress
+ * plugins are conventionally named after their slug, so the second guess is usually
+ * right when the header is missing — matomo-for-wordpress ships `matomo.php`.
+ */
+function wporgSlugCandidates(project, repoName) {
+	const candidates = [
+		project.wporgSlug,
+		path.basename(project.mainFile || '', '.php'),
+		repoName,
+	];
+	const seen = new Set();
+	return candidates
+		.map((s) => (s || '').toLowerCase())
+		.filter((s) => /^[a-z0-9][a-z0-9._-]*$/.test(s) && !seen.has(s) && seen.add(s));
+}
+
+/** The version wordpress.org is serving for this plugin, or null if it is not there. */
+async function findWporgRelease(project, repoName) {
+	if (!USE_WPORG || project.type !== 'wordpress' || !wporgReachable) return null;
+
+	for (const slug of wporgSlugCandidates(project, repoName)) {
+		const res = await fetchJson(`${WPORG_API}/${encodeURIComponent(slug)}.json`);
+		if (res.status === 0) {
+			// Could not connect at all, as opposed to "no such plugin".
+			wporgReachable = false;
+			return null;
+		}
+		if (res.status !== 200 || !res.body || res.body.error || !res.body.version) continue;
+		return { slug, version: String(res.body.version) };
+	}
+	return null;
+}
+
 // --- what was actually released ----------------------------------------------
 // Tag names that name a version. Anything else (`latest`, `dev`, …) is not a release.
 const TAG_VERSION_RE = /^v?\d+\.\d+(\.\d+)?$/;
@@ -502,35 +604,58 @@ function findLatestReleaseTag(cwd, branchRef) {
  * plugins routinely bump the version inside an ordinary pull request and only tag (and
  * publish) the release later, so a repo can sit at 5.3.9 while 5.3.8 is still its last
  * real release. When that happens:
- *   - the unreleased work is everything merged since the 5.3.8 TAG, not since the commit
- *     that set 5.3.9 (which would hide every PR that went out with, or before, the bump);
+ *   - the unreleased work is everything merged since the 5.3.8 RELEASE, not since the
+ *     commit that set 5.3.9 (which would hide every PR that went out with, or before,
+ *     the bump);
  *   - the release to make is 5.3.9 itself, so nothing needs bumping — only the changelog
- *     may need topping up before it is tagged.
+ *     may need topping up before it goes out.
  *
- * With no version tags to go on (a repo that has never been tagged) we fall back to the
- * original behaviour: measure from the commit that set the current version.
+ * Two things count as evidence that a version really shipped, and the newest of them
+ * wins: a version tag reachable from this branch, and — for a plugin in the WordPress
+ * plugin directory — the version wordpress.org is serving. They disagree in both
+ * directions: a tag can be cut before the deploy, and a wordpress.org release is pushed
+ * over SVN, which can happen without a tag ever being made (wp-matomo has shipped three
+ * versions past its newest tag).
+ *
+ * With no evidence at all — never tagged, not on wordpress.org — we fall back to the
+ * original behaviour and measure from the commit that set the current version.
  */
-function resolveBaseline(cwd, project, branchRef) {
-	let latest = findLatestReleaseTag(cwd, branchRef);
-	if (!latest) {
+async function resolveBaseline(cwd, project, branchRef, repoName) {
+	let tag = findLatestReleaseTag(cwd, branchRef);
+	if (!tag) {
 		// A plain fetch auto-follows tags that point into the history it fetched, so the
 		// release tags on this branch are normally here already. Finding none is the one
 		// case worth spending a second round trip on — the remote may be configured not
 		// to send tags at all.
-		if (gitOk(cwd, ['fetch', '--tags', 'origin'])) latest = findLatestReleaseTag(cwd, branchRef);
+		if (gitOk(cwd, ['fetch', '--tags', 'origin'])) tag = findLatestReleaseTag(cwd, branchRef);
 	}
 
-	if (latest && compareVersions(project.version, latest.version) > 0) {
-		return { pending: true, latest, sinceSha: latest.sha, target: project.version };
+	let released = tag ? { version: tag.version, sha: tag.sha, label: `tag ${tag.tag}, ${tag.date}` } : null;
+
+	const wporg = await findWporgRelease(project, repoName);
+	if (wporg && (!released || compareVersions(wporg.version, released.version) > 0)) {
+		// wordpress.org names a version but no commit, so find where that version was
+		// set: nothing merged after that point can have been part of the release.
+		const sha = findVersionSetCommit(cwd, project, branchRef, wporg.version);
+		released = sha
+			? { version: wporg.version, sha, label: `published on wordpress.org as "${wporg.slug}"` }
+			// Published, but this branch never declared that version — released from
+			// somewhere else. Keep the tag as the baseline and let the caller say so.
+			: { ...(released || {}), unplaced: wporg };
+	}
+
+	if (released && released.sha && compareVersions(project.version, released.version) > 0) {
+		return { pending: true, released, sinceSha: released.sha, target: project.version };
 	}
 
 	const bumpCommit = findVersionBumpCommit(cwd, project, branchRef);
 	return {
 		pending: false,
-		latest,
-		// The declared version is BEHIND the newest tag — someone released from elsewhere,
-		// or the version file was reverted. Worth saying out loud before releasing again.
-		behind: !!latest && compareVersions(project.version, latest.version) < 0,
+		released: released && released.version ? released : null,
+		unplaced: released && released.unplaced,
+		// The declared version is BEHIND what shipped — released from another branch, or
+		// the version file was reverted. Worth saying out loud before releasing again.
+		behind: !!(released && released.version) && compareVersions(project.version, released.version) < 0,
 		bumpCommit,
 		sinceSha: bumpCommit,
 		target: bumpVersion(project.version, 'patch'),
@@ -949,14 +1074,17 @@ async function checkRepo(dir) {
 	}
 	info(`${project.type} plugin, current version ${project.version} (from ${project.versionFile} on ${branchRef})`);
 
-	const baseline = resolveBaseline(cwd, project, branchRef);
+	const baseline = await resolveBaseline(cwd, project, branchRef, name);
 	if (baseline.pending) {
 		warn(`version ${project.version} is set in ${project.versionFile} but was never released`);
-		note(`last release: ${baseline.latest.version} (tag ${baseline.latest.tag}, ${baseline.latest.date})`);
-	} else if (!baseline.latest) {
-		note('no version tags found — measuring from the commit that set the current version');
+		note(`last release: ${baseline.released.version} (${baseline.released.label})`);
+	} else if (!baseline.released) {
+		note('no released version found — measuring from the commit that set the current version');
 	} else if (baseline.behind) {
-		warn(`version ${project.version} is BEHIND the newest tag ${baseline.latest.tag} — check which branch that was released from`);
+		warn(`version ${project.version} is BEHIND the last release ${baseline.released.version} (${baseline.released.label}) — check where that was released from`);
+	}
+	if (baseline.unplaced) {
+		warn(`wordpress.org serves ${baseline.unplaced.version} of "${baseline.unplaced.slug}", which this branch never declared — going by tags instead`);
 	}
 	if (!baseline.sinceSha) {
 		// The release run offers to fall back to the whole history here, but that is a
@@ -965,7 +1093,7 @@ async function checkRepo(dir) {
 		return SKIP;
 	}
 	const since = baseline.pending
-		? `the ${baseline.latest.version} release`
+		? `the ${baseline.released.version} release`
 		: project.version;
 	if (!baseline.pending) {
 		const when = gitOut(cwd, ['log', '-1', '--format=%h %ad', '--date=short', baseline.sinceSha]);
@@ -984,7 +1112,7 @@ async function checkRepo(dir) {
 		if (baseline.pending) {
 			// Nothing to write, but the version still has not gone out.
 			warn(`${project.version} is unreleased and there is nothing to add to its changelog — it needs tagging/releasing, not a release commit`);
-			checkReport.push({ repo: name, version: project.version, suggested: project.version, pending: true, latest: baseline.latest, prs, documented, chores, others });
+			checkReport.push({ repo: name, version: project.version, suggested: project.version, pending: true, released: baseline.released, prs, documented, chores, others });
 			return NEEDED;
 		}
 		ok(`no pull requests merged since ${project.version} — no release needed`);
@@ -1022,7 +1150,7 @@ async function checkRepo(dir) {
 		if (others.length > 10) note(c('0;90', `  … and ${others.length - 10} more`));
 	}
 
-	checkReport.push({ repo: name, version: project.version, suggested, pending: baseline.pending, latest: baseline.latest, prs, documented, tagOnly, chores, others });
+	checkReport.push({ repo: name, version: project.version, suggested, pending: baseline.pending, released: baseline.released, prs, documented, tagOnly, chores, others });
 	return NEEDED;
 }
 
@@ -1102,16 +1230,20 @@ async function processRepo(dir) {
 	info(`${project.type} plugin, current version ${project.version} (from ${project.versionFile})`);
 
 	// --- what has not been released yet? --------------------------------------
-	const baseline = resolveBaseline(cwd, project, defaultBranch);
+	const baseline = await resolveBaseline(cwd, project, defaultBranch, name);
 	if (baseline.pending) {
 		warn(`version ${project.version} is set in ${project.versionFile} but was never released`);
-		note(`last release: ${baseline.latest.version} (tag ${baseline.latest.tag}, ${baseline.latest.date})`);
+		note(`last release: ${baseline.released.version} (${baseline.released.label})`);
 		note(`everything merged since then is unreleased, and ${project.version} itself is still to go out`);
-	} else if (!baseline.latest) {
-		note('no version tags found — measuring from the commit that set the current version');
+	} else if (!baseline.released) {
+		note('no released version found — measuring from the commit that set the current version');
 	} else if (baseline.behind) {
-		warn(`version ${project.version} is BEHIND the newest tag ${baseline.latest.tag} — check which branch that was released from`);
-		followUps.push({ repo: name, detail: `the declared version ${project.version} is older than the newest tag ${baseline.latest.tag}` });
+		warn(`version ${project.version} is BEHIND the last release ${baseline.released.version} (${baseline.released.label}) — check where that was released from`);
+		followUps.push({ repo: name, detail: `the declared version ${project.version} is older than the last release ${baseline.released.version}` });
+	}
+	if (baseline.unplaced) {
+		warn(`wordpress.org serves ${baseline.unplaced.version} of "${baseline.unplaced.slug}", which this branch never declared — going by tags instead`);
+		followUps.push({ repo: name, detail: `wordpress.org publishes ${baseline.unplaced.version}, which this branch never declared — check which branch releases go out from` });
 	}
 
 	if (!baseline.sinceSha) {
@@ -1126,7 +1258,7 @@ async function processRepo(dir) {
 		info(`version ${project.version} was set in ${when}`);
 	}
 
-	const since = baseline.pending ? `the ${baseline.latest.version} release` : project.version;
+	const since = baseline.pending ? `the ${baseline.released.version} release` : project.version;
 	const { prs: allPrs, others } = collectPullRequests(cwd, defaultBranch, baseline.sinceSha);
 
 	// `[no_release]` work — test fixes, screenshot updates — is not a reason to release
@@ -1421,7 +1553,7 @@ async function main() {
 			console.log(c('1;37', `${checkReport.length} repo(s) need a release:`));
 			for (const r of checkReport) {
 				const what = r.pending
-					? `${r.version} is bumped but unreleased (last release ${r.latest.version})`
+					? `${r.version} is bumped but unreleased (last release ${r.released.version})`
 					: `${r.version} -> ${r.suggested} (patch)`;
 				const count = !r.prs.length || r.tagOnly
 					? ' — needs tagging only'

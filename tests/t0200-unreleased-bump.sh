@@ -148,7 +148,7 @@ test_a_repo_with_no_tags_falls_back_to_the_version_bump_commit() {
 
     qr check foo
 
-    assert_contains 'check output' "$QR_OUT" 'no version tags found'
+    assert_contains 'check output' "$QR_OUT" 'no released version found'
     assert_contains 'check output' "$QR_OUT" 'release needed: 1 pull request(s) merged since 1.0.0'
     assert_contains 'summary' "$QR_OUT" 'foo: 1.0.0 -> 1.0.1 (patch)'
 }
@@ -161,7 +161,7 @@ test_a_version_older_than_the_newest_tag_is_flagged() {
 
     qr check foo
 
-    assert_contains 'check output' "$QR_OUT" 'version 1.0.0 is BEHIND the newest tag 2.0.0'
+    assert_contains 'check output' "$QR_OUT" 'version 1.0.0 is BEHIND the last release 2.0.0 (tag 2.0.0'
 }
 
 test_v_prefixed_tags_count_as_releases() {

@@ -26,6 +26,10 @@ setup_sandbox() {
     export GIT_COMMITTER_NAME='Test Author' GIT_COMMITTER_EMAIL='author@test.invalid'
     export NO_COLOR=1
 
+    # No test may reach the network. The tests that do cover the wordpress.org
+    # lookup point it at a stub server instead (see with_wporg_stub).
+    export QUICK_RELEASER_NO_WPORG=1
+
     git config --global init.defaultBranch main
     git config --global user.name 'Test Author'
     git config --global user.email 'author@test.invalid'
@@ -99,6 +103,36 @@ qr() {  # qr <args...>
     QR_RC=$?
     set -e
     return 0
+}
+
+# Point the wordpress.org lookup at a local stub for the rest of this test.
+# The map is slug => published version, e.g. with_wporg_stub '{"wpfoo":"1.0.3"}'.
+# The stub dies with the test, including when an assertion aborts it.
+with_wporg_stub() { # <slug-to-version-json>
+    local port_file="$TEST_TMP/.wporg-port"
+    rm -f "$port_file" "$port_file.requests"
+    : > "$port_file.requests"
+
+    node "$TESTS_DIR/wporg-stub.js" "$1" "$port_file" &
+    WPORG_PID=$!
+    # shellcheck disable=SC2064
+    trap "kill $WPORG_PID 2>/dev/null" EXIT
+
+    local waited=0
+    while [ ! -s "$port_file" ]; do
+        sleep 0.05
+        waited=$((waited + 1))
+        [ "$waited" -lt 100 ] || _fail 'the wordpress.org stub never started listening'
+    done
+
+    export QUICK_RELEASER_WPORG_API
+    QUICK_RELEASER_WPORG_API="$(cat "$port_file")"
+    unset QUICK_RELEASER_NO_WPORG
+}
+
+# The slugs the run asked the stub about, in order, space separated.
+wporg_requests() {
+    tr '\n' ' ' < "$TEST_TMP/.wporg-port.requests" | sed 's/ $//'
 }
 
 # The release run is interactive. QUICK_RELEASER_INPUT feeds it one answer per
@@ -260,6 +294,23 @@ pr_merge() {    # <repo> <number> <title>
 
 $t" "pr-$n"
     git -C "$r" branch -q -D "pr-$n"
+}
+
+# A pull request that bumps the version, which is how these plugins usually get
+# bumped: inside ordinary work, well before the release goes out.
+bump_pr() { # <repo> <number> <old> <new> [title]
+    local r="$1" n="$2" o="$3" v="$4"
+    local t="${5:-bump version to $v}"
+    set_version "$r" "$o" "$v"
+    printf '// %s\n' "$t" >> "$r/src.php"
+    git -C "$r" add -A
+    git -C "$r" commit -qm "$t (#$n)"
+}
+
+# Give a WordPress plugin a Plugin URI header naming its directory slug.
+set_plugin_uri() {  # <repo> <main-file> <url>
+    sed -i "s|^ \* Plugin Name:| * Plugin URI: $3\n * Plugin Name:|" "$1/$2"
+    git -C "$1" commit -qam 'add the plugin uri header'
 }
 
 # A commit that is not a pull request at all.

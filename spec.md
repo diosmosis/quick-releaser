@@ -46,8 +46,15 @@ The version declared in a project's source is not proof that the version was rel
 version inside an ordinary pull request and only tag (and publish a github release) later, so a project can sit at
 5.3.9 while 5.3.8 is still its last real release.
 
-The last *released* version is therefore taken from the newest version tag reachable from the default branch, not from
-the version file. When the declared version is ahead of that tag:
+The last *released* version is therefore worked out from evidence that a release actually happened, not from the
+version file. Two things count, and the newest of them wins:
+
+1. the newest version tag reachable from the default branch. tags named `v1.2.3` count the same as `1.2.3`; anything
+   that is not a version is not a release.
+2. for a WordPress plugin published in the [wordpress.org plugin directory](https://wordpress.org/plugins/), the
+   version the directory is serving — see [wordpress.org](#wordpressorg) below.
+
+When the declared version is ahead of the last released version:
 
 1. the unreleased work is everything merged since the tag, not since the commit that set the declared version (which
    would hide every pull request that shipped with, or before, the bump).
@@ -61,9 +68,28 @@ the version file. When the declared version is ahead of that tag:
 6. if there is nothing left to write — the version is bumped and its changelog is already complete — no commit is made.
    the repo only needs tagging/releasing, which is reported.
 
-A project with no version tags at all falls back to the original behaviour: measure from the commit that set the
-current version. A declared version *older* than the newest tag is reported, since it usually means the release came
-from a different branch.
+A project with no evidence of any release at all — never tagged, not in the plugin directory — falls back to the
+original behaviour: measure from the commit that set the current version. A declared version *older* than the last
+release is reported, since it usually means the release came from a different branch.
+
+## wordpress.org
+
+Plugins in the WordPress plugin directory are released by pushing to their SVN repo, which git knows nothing about, so
+the git tags can lag badly: wp-matomo has shipped three versions past its newest tag. For a WordPress plugin, the
+version `https://api.wordpress.org/plugins/info/1.0/{slug}.json` reports is therefore taken as a release like a tag is,
+and whichever is newer decides what counts as released.
+
+1. the slug is guessed in this order, and the first one the directory answers for is used: the slug named by the
+   plugin's `Plugin URI` header when it points at wordpress.org (the old `/extend/plugins/` form included), the main
+   plugin file's name, then the folder's name. Plugins are conventionally named after their slug, so the second guess
+   covers the ones with no such header.
+2. the directory reports a version but no commit, so the baseline is the commit that set that version in the version
+   file. work merged after that point cannot have been in the release.
+3. a published version that this branch never declared is reported and otherwise ignored — it means releases go out
+   from somewhere else — and the tags decide instead.
+4. a plugin the directory does not know is not an error; it just has no published version, so the tags decide.
+5. it must never be able to break a run: any connection failure is reported once and the whole run falls back to tags.
+   `--no-wporg` skips the lookups altogether, and Matomo plugins are never looked up at all.
 
 ## Check Execution
 
